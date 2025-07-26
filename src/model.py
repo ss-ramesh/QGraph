@@ -382,6 +382,81 @@ class QGraphPredictor(nn.Module):
         """Store current parameters for Q-EWC"""
         self.optimal_params = {i: self.weights[i].item() for i in range(len(self.weights))}
 
+class EnhancedQGraphPredictor(QGraphPredictor):
+    """Enhanced Q-Graph with specific flood timing and depth prediction"""
+    
+    def __init__(self, quantum_circuit: QuantumFloodCircuit, flood_threshold: float = 2.0):
+        super().__init__(quantum_circuit)
+        self.flood_threshold = flood_threshold  # meters
+        # Add depth prediction head
+        input_size = len(self.input_params) if hasattr(self, 'input_params') else 8
+        self.depth_predictor = nn.Sequential(
+            nn.Linear(input_size, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+            nn.ReLU()  # Ensure positive depth
+        )
+        
+    def predict_flood_event(self, data: pyg_data.Data, current_time: int, 
+                           node_id: int, max_lookahead: int = 30) -> Dict:
+        """Predict specific flood event for a node"""
+        
+        # Ensure node_id is within bounds
+        if node_id >= data.num_nodes:
+            node_id = min(node_id, data.num_nodes - 1)
+        
+        # Multi-step prediction
+        predicted_depths = []
+        flood_probabilities = []
+        
+        for future_step in range(current_time, min(current_time + max_lookahead, data.num_time_steps)):
+            # Get active edges for this time step
+            active_edges = self.identify_active_edges(data, future_step)
+            
+            # Predict flood probability
+            flood_prob, overlap = self.forward(data, future_step, active_edges)
+            flood_probabilities.append(flood_prob.item())
+            
+            # Predict water depth for specific node
+            static_features = data.x[node_id]
+            dynamic_features = data.dynamic[node_id, future_step, :]
+            node_features = torch.cat([static_features, dynamic_features])
+            
+            # Ensure input size matches depth predictor
+            input_size = self.depth_predictor[0].in_features
+            node_input = node_features[:input_size]
+            if len(node_input) < input_size:
+                # Pad with zeros if not enough features
+                padding = torch.zeros(input_size - len(node_input))
+                node_input = torch.cat([node_input, padding])
+            
+            predicted_depth = self.depth_predictor(node_input)
+            predicted_depths.append(predicted_depth.item())
+        
+        # Find when flooding occurs
+        flood_time = None
+        flood_depth = None
+        
+        for i, (depth, prob) in enumerate(zip(predicted_depths, flood_probabilities)):
+            if depth > self.flood_threshold and prob > 0.5:  # Both depth and probability thresholds
+                flood_time = i  # Time steps from current
+                flood_depth = depth
+                break
+        
+        return {
+            'node_id': node_id,
+            'current_time_step': current_time,
+            'will_flood': flood_time is not None,
+            'time_to_flood_steps': flood_time,
+            'time_to_flood_minutes': flood_time * 5 if flood_time else None,  # Assuming 5 min per step
+            'predicted_depth_meters': flood_depth,
+            'confidence': max(flood_probabilities) if flood_probabilities else 0.0,
+            'depth_progression': predicted_depths,
+            'probability_progression': flood_probabilities
+        }
+
 class QVISMTransparencyEngine:
     """QVISM: Quantum Variational Interpretability and Sensitivity Mapping"""
     def __init__(self, predictor: QGraphPredictor):
@@ -444,22 +519,163 @@ class QVISMTransparencyEngine:
         drift = np.mean(np.abs(current_weights[:min_len] - self.initial_params[:min_len]))
         return float(drift)
 
+class EnhancedQVISMTransparencyEngine(QVISMTransparencyEngine):
+    """Enhanced QVISM with specific flood event reporting"""
+    
+    def __init__(self, predictor: EnhancedQGraphPredictor):
+        super().__init__(predictor)
+        
+    def generate_flood_alert(self, data: pyg_data.Data, current_time: int, 
+                           node_id: int = None) -> str:
+        """Generate human-readable flood alert"""
+        
+        if node_id is None:
+            # Find highest risk node
+            risk_scores = []
+            for i in range(min(10, data.num_nodes)):  # Check first 10 nodes
+                prediction = self.predictor.predict_flood_event(data, current_time, i)
+                risk_score = prediction['confidence'] if prediction['will_flood'] else 0.0
+                risk_scores.append((i, risk_score))
+            
+            if not risk_scores or max(risk_scores, key=lambda x: x[1])[1] == 0:
+                return "No immediate flood risk detected in monitored areas."
+            
+            node_id = max(risk_scores, key=lambda x: x[1])[0]
+        
+        prediction = self.predictor.predict_flood_event(data, current_time, node_id)
+        
+        if prediction['will_flood']:
+            return (f"**Grid cell {node_id}** is expected to flood in "
+                   f"**{prediction['time_to_flood_minutes']} minutes** with a predicted "
+                   f"water depth of **{prediction['predicted_depth_meters']:.1f} meters**. "
+                   f"(Confidence: {prediction['confidence']:.2f})")
+        else:
+            current_depth = prediction['depth_progression'][0] if prediction['depth_progression'] else 0
+            return (f"**Grid cell {node_id}** is not expected to flood in the next "
+                   f"{len(prediction['depth_progression']) * 5} minutes. "
+                   f"Current predicted depth: {current_depth:.1f} meters.")
+    
+    def generate_detailed_flood_report(self, data: pyg_data.Data, current_time: int) -> Dict:
+        """Generate detailed flood report for all high-risk nodes"""
+        high_risk_nodes = []
+        
+        for node_id in range(min(data.num_nodes, 20)):  # Check up to 20 nodes
+            prediction = self.predictor.predict_flood_event(data, current_time, node_id)
+            if prediction['will_flood'] or prediction['confidence'] > 0.3:
+                high_risk_nodes.append(prediction)
+        
+        # Sort by urgency (time to flood, then confidence)
+        high_risk_nodes.sort(key=lambda x: (
+            x['time_to_flood_minutes'] if x['will_flood'] else float('inf'),
+            -x['confidence']
+        ))
+        
+        return {
+            'current_time_step': current_time,
+            'total_monitored_nodes': min(data.num_nodes, 20),
+            'high_risk_count': len(high_risk_nodes),
+            'immediate_threats': [n for n in high_risk_nodes if n['will_flood'] and n['time_to_flood_minutes'] <= 30],
+            'emerging_risks': [n for n in high_risk_nodes if not n['will_flood'] and n['confidence'] > 0.5],
+            'all_predictions': high_risk_nodes
+        }
+
 async def main():
-    """Main execution for Q-Graph"""
+    """Main execution for Enhanced Q-Graph"""
     data_pipeline = FloodDataPipeline()
     train_data = data_pipeline.load_flood_data('/Users/santoshramesh/Desktop/NASA-BTA-ESTO/data/FloodGNN-GRU/train.npz')
     
     for sample_idx, data in enumerate(train_data):
         num_features = data.x.shape[1] + data.dynamic.shape[2]
         quantum_circuit = QuantumFloodCircuit(num_features, data.num_edges, active_edges=[])
-        predictor = QGraphPredictor(quantum_circuit)
-        qvism = QVISMTransparencyEngine(predictor)
+        predictor = EnhancedQGraphPredictor(quantum_circuit, flood_threshold=2.0)
+        qvism = EnhancedQVISMTransparencyEngine(predictor)
         
-        print(f"\nProcessing Sample {sample_idx} (Nodes: {data.num_nodes}, Edges: {data.num_edges}, Time Steps: {data.num_time_steps})")
-        for t in range(min(20, data.num_time_steps)):
-            report = qvism.generate_transparency_report(data, t)
-            print(f"Time step {t}: Flood Risk = {report['average_flood_risk']:.4f} ({report['risk_level']}), "
-                  f"Active Edges = {report['active_edges']}, Hilbert Overlap = {report['hilbert_space_overlap']:.4f}")
+        print(f"\n{'='*80}")
+        print(f"PROCESSING SAMPLE {sample_idx}")
+        print(f"Nodes: {data.num_nodes}, Edges: {data.num_edges}, Time Steps: {data.num_time_steps}")
+        print(f"{'='*80}")
+        
+        # Generate specific flood alerts every few time steps
+        for t in range(0, min(20, data.num_time_steps), 3):
+            print(f"\n--- TIME STEP {t} ---")
+            
+            # Generate main flood alert
+            alert = qvism.generate_flood_alert(data, t)
+            print(f"FLOOD ALERT: {alert}")
+            
+            # Generate detailed report for high-risk areas
+            detailed_report = qvism.generate_detailed_flood_report(data, t)
+            
+            if detailed_report['immediate_threats']:
+                print(f"\n⚠️  IMMEDIATE THREATS ({len(detailed_report['immediate_threats'])}):")
+                for threat in detailed_report['immediate_threats'][:3]:  # Show top 3
+                    print(f"   • Grid cell {threat['node_id']}: {threat['time_to_flood_minutes']}min, "
+                          f"{threat['predicted_depth_meters']:.1f}m depth")
+            
+            if detailed_report['emerging_risks']:
+                print(f"\n📊 EMERGING RISKS ({len(detailed_report['emerging_risks'])}):")
+                for risk in detailed_report['emerging_risks'][:3]:  # Show top 3
+                    current_depth = risk['depth_progression'][0] if risk['depth_progression'] else 0
+                    print(f"   • Grid cell {risk['node_id']}: {risk['confidence']:.2f} confidence, "
+                          f"{current_depth:.1f}m current depth")
+            
+            # Show detailed prediction for specific node (node 4 if exists)
+            if t == 0 and data.num_nodes > 4:
+                print(f"\n🔍 DETAILED ANALYSIS - Grid Cell 4:")
+                detailed_pred = predictor.predict_flood_event(data, t, node_id=4)
+                if detailed_pred['will_flood']:
+                    print(f"   **Grid cell 4** is expected to flood in "
+                          f"**{detailed_pred['time_to_flood_minutes']} minutes** with a predicted "
+                          f"water depth of **{detailed_pred['predicted_depth_meters']:.1f} meters**.")
+                else:
+                    current_depth = detailed_pred['depth_progression'][0] if detailed_pred['depth_progression'] else 0
+                    print(f"   Grid cell 4 is not expected to flood in the next "
+                          f"{len(detailed_pred['depth_progression']) * 5} minutes. "
+                          f"Current predicted depth: {current_depth:.1f} meters.")
+                
+                print(f"   Confidence: {detailed_pred['confidence']:.3f}")
+                print(f"   Depth progression (next 6 steps): {[f'{d:.1f}m' for d in detailed_pred['depth_progression'][:6]]}")
+            
+            # Original QVISM transparency report
+            transparency_report = qvism.generate_transparency_report(data, t)
+            print(f"\n📈 QVISM ANALYSIS:")
+            print(f"   Risk Level: {transparency_report['risk_level']}")
+            print(f"   Active Edges: {transparency_report['active_edges']}")
+            print(f"   Hilbert Overlap: {transparency_report['hilbert_space_overlap']:.4f}")
+            print(f"   Temporal Drift: {transparency_report['temporal_drift']:.4f}")
+
+        # Update continual learning
+        predictor.update_continual_learning([data] + data_pipeline.get_replay_data())
+        data_pipeline.memory.append(data)
+        
+        print(f"\n✅ Sample {sample_idx} processing complete. Updated continual learning parameters.")
+
+async def enhanced_main():
+    """Enhanced main execution with specific flood predictions"""
+    data_pipeline = FloodDataPipeline()
+    file_path = input ("Input the full path to the FloodGNN-GRU dataset (e.g., '/path/to/train.npz'): ")
+    train_data = data_pipeline.load_flood_data(file_path)
+    
+    for sample_idx, data in enumerate(train_data):
+        num_features = data.x.shape[1] + data.dynamic.shape[2]
+        quantum_circuit = QuantumFloodCircuit(num_features, data.num_edges, active_edges=[])
+        predictor = EnhancedQGraphPredictor(quantum_circuit, flood_threshold=2.0)
+        qvism = EnhancedQVISMTransparencyEngine(predictor)
+        
+        print(f"\nProcessing Sample {sample_idx} (Nodes: {data.num_nodes}, Edges: {data.num_edges})")
+        
+        # Generate specific flood alerts every few time steps
+        for t in range(0, min(20, data.num_time_steps), 5):
+            alert = qvism.generate_flood_alert(data, t)
+            print(f"Time step {t}: {alert}")
+            
+            # Optional: Show detailed prediction for specific node
+            if t == 0:  # Show detailed prediction at start
+                node_to_check = min(4, data.num_nodes - 1)
+                detailed_pred = predictor.predict_flood_event(data, t, node_id=node_to_check)
+                if detailed_pred['will_flood']:
+                    print(f"  Detailed: Node {node_to_check} flood in {detailed_pred['time_to_flood_minutes']}min, "
+                          f"depth {detailed_pred['predicted_depth_meters']:.1f}m")
 
         predictor.update_continual_learning([data] + data_pipeline.get_replay_data())
         data_pipeline.memory.append(data)
